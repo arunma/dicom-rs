@@ -8,16 +8,17 @@
 //! License: <https://github.com/pydicom/pydicom/blob/master/LICENSE>
 use byteordered::byteorder::{ByteOrder, LittleEndian};
 
+use dicom_encoding::adapters::decode_error::FrameRangeOutOfBoundsSnafu;
+use dicom_encoding::adapters::{decode_error, DecodeResult, PixelDataObject, PixelDataReader};
 use dicom_encoding::snafu::prelude::*;
-use dicom_encoding::adapters::{DecodeResult, PixelDataObject, PixelRWAdapter, decode_error};
 use std::io::{self, Read, Seek};
 
-/// Pixel data adapter for the RLE Lossless transfer syntax. 
+/// Pixel data adapter for the RLE Lossless transfer syntax.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RleLosslessAdapter;
 
-/// Decode TS: 1.2.840.10008.1.2.5 (RLE Lossless)
-impl PixelRWAdapter for RleLosslessAdapter {
+/// Pixel data decoder for RLE Lossless (UID `1.2.840.10008.1.2.5`)
+impl PixelDataReader for RleLosslessAdapter {
     /// Decode the DICOM image from RLE Lossless completely.
     ///
     /// See <http://dicom.nema.org/medical/Dicom/2018d/output/chtml/part05/chapter_G.html>
@@ -25,13 +26,19 @@ impl PixelRWAdapter for RleLosslessAdapter {
         let cols = src
             .cols()
             .context(decode_error::MissingAttributeSnafu { name: "Columns" })?;
-        let rows = src.rows().context(decode_error::MissingAttributeSnafu { name: "Rows" })?;
-        let samples_per_pixel = src.samples_per_pixel().context(decode_error::MissingAttributeSnafu {
-            name: "SamplesPerPixel",
-        })?;
-        let bits_allocated = src.bits_allocated().context(decode_error::MissingAttributeSnafu {
-            name: "BitsAllocated",
-        })?;
+        let rows = src
+            .rows()
+            .context(decode_error::MissingAttributeSnafu { name: "Rows" })?;
+        let samples_per_pixel =
+            src.samples_per_pixel()
+                .context(decode_error::MissingAttributeSnafu {
+                    name: "SamplesPerPixel",
+                })?;
+        let bits_allocated = src
+            .bits_allocated()
+            .context(decode_error::MissingAttributeSnafu {
+                name: "BitsAllocated",
+            })?;
 
         if bits_allocated != 8 && bits_allocated != 16 {
             whatever!("BitsAllocated other than 8 or 16 is not supported");
@@ -44,7 +51,12 @@ impl PixelRWAdapter for RleLosslessAdapter {
         let bytes_per_sample = bits_allocated / 8;
         // `stride` it the total number of bytes for each sample plane
         let stride = bytes_per_sample * cols * rows;
-        dst.resize((samples_per_pixel * stride) as usize * nr_frames, 0);
+        // extend `dst` to make room for decoded pixel data
+        let base_offset = dst.len();
+        dst.resize(
+            base_offset + (samples_per_pixel * stride) as usize * nr_frames,
+            0,
+        );
 
         // RLE encoded data is ordered like this (for 16-bit, 3 sample):
         //  Segment: 0     | 1     | 2     | 3     | 4     | 5
@@ -88,8 +100,97 @@ impl PixelRWAdapter for RleLosslessAdapter {
                     for (decoded_index, dst_index) in
                         (start..end).step_by(bytes_per_sample as usize).enumerate()
                     {
-                        dst[dst_index] = decoded_segment[decoded_index];
+                        dst[base_offset + dst_index] = decoded_segment[decoded_index];
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Decode a singe frame of the DICOM image from RLE Lossless.
+    ///
+    /// See <http://dicom.nema.org/medical/Dicom/2018d/output/chtml/part05/chapter_G.html>
+    fn decode_frame(
+        &self,
+        src: &dyn PixelDataObject,
+        frame: u32,
+        dst: &mut Vec<u8>,
+    ) -> DecodeResult<()> {
+        let cols = src
+            .cols()
+            .context(decode_error::MissingAttributeSnafu { name: "Columns" })?;
+        let rows = src
+            .rows()
+            .context(decode_error::MissingAttributeSnafu { name: "Rows" })?;
+        let samples_per_pixel =
+            src.samples_per_pixel()
+                .context(decode_error::MissingAttributeSnafu {
+                    name: "SamplesPerPixel",
+                })?;
+        let bits_allocated = src
+            .bits_allocated()
+            .context(decode_error::MissingAttributeSnafu {
+                name: "BitsAllocated",
+            })?;
+
+        if bits_allocated != 8 && bits_allocated != 16 {
+            whatever!("BitsAllocated other than 8 or 16 is not supported");
+        }
+        // For RLE the number of fragments = number of frames
+        // therefore, we can fetch the fragments one-by-one
+        let nr_frames =
+            src.number_of_fragments()
+                .whatever_context("Invalid pixel data, no fragments found")? as usize;
+        ensure!(nr_frames > frame as usize, FrameRangeOutOfBoundsSnafu);
+
+        let bytes_per_sample = bits_allocated / 8;
+        // `stride` it the total number of bytes for each sample plane
+        let stride = bytes_per_sample * cols * rows;
+        // extend `dst` to make room for decoded pixel data
+        let base_offset = dst.len();
+        dst.resize(base_offset + (samples_per_pixel * stride) as usize, 0);
+
+        // RLE encoded data is ordered like this (for 16-bit, 3 sample):
+        //  Segment: 0     | 1     | 2     | 3     | 4     | 5
+        //           R MSB | R LSB | G MSB | G LSB | B MSB | B LSB
+        //  A segment contains only the MSB or LSB parts of all the sample pixels
+
+        // To minimise the amount of array manipulation later, and to make things
+        // faster we interleave each segment in a manner consistent with a planar
+        // configuration of 1 (and use little endian byte ordering):
+        //    All red samples             | All green samples           | All blue
+        //    Pxl 1   Pxl 2   ... Pxl N   | Pxl 1   Pxl 2   ... Pxl N   | ...
+        //    LSB MSB LSB MSB ... LSB MSB | LSB MSB LSB MSB ... LSB MSB | ...
+
+        let fragment = &src
+            .fragment(frame as usize)
+            .whatever_context("No pixel data found for frame")?;
+        let mut offsets = read_rle_header(fragment);
+        offsets.push(fragment.len() as u32);
+
+        for sample_number in 0..samples_per_pixel {
+            for byte_offset in (0..bytes_per_sample).rev() {
+                // ii is 1, 0, 3, 2, 5, 4 for the example above
+                // This is where the segment order correction occurs
+                let ii = sample_number * bytes_per_sample + byte_offset;
+                let segment =
+                    &fragment[offsets[ii as usize] as usize..offsets[(ii + 1) as usize] as usize];
+                let buff = io::Cursor::new(segment);
+                let (_, mut decoder) = PackBitsReader::new(buff, segment.len())
+                    .map_err(|e| Box::new(e) as Box<_>)
+                    .whatever_context("Failed to read RLE segments")?;
+                let mut decoded_segment: Vec<u8> = vec![0; (rows * cols) as usize];
+                decoder.read_exact(&mut decoded_segment).unwrap();
+
+                // Interleave pixels as described in the example above
+                let byte_offset = bytes_per_sample - byte_offset - 1;
+                let start = byte_offset as usize + (sample_number * stride) as usize;
+                let end = start + stride as usize;
+                for (decoded_index, dst_index) in
+                    (start..end).step_by(bytes_per_sample as usize).enumerate()
+                {
+                    dst[base_offset + dst_index] = decoded_segment[decoded_index];
                 }
             }
         }

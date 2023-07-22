@@ -5,8 +5,8 @@ use dicom_encoding::adapters::DecodeError;
 use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
 use gdcm_rs::{
-    decode_multi_frame_compressed, decode_single_frame_compressed, Error as GDCMError,
-    GDCMPhotometricInterpretation, GDCMTransferSyntax,
+    decode_single_frame_compressed, Error as GDCMError, GDCMPhotometricInterpretation,
+    GDCMTransferSyntax,
 };
 use std::{convert::TryFrom, str::FromStr};
 
@@ -66,7 +66,7 @@ where
                     source: Some(Box::new(source)),
                 };
                 if fragments.len() > 1 {
-                    // Bundle fragments and decode multi-frame dicoms
+                    /*  // Bundle fragments and decode multi-frame dicoms
                     let dims = [cols.into(), rows.into(), number_of_frames.into()];
                     let fragments: Vec<_> = fragments.iter().map(|frag| frag.as_slice()).collect();
                     decode_multi_frame_compressed(
@@ -82,7 +82,8 @@ where
                     )
                     .map_err(gdcm_error_mapper)
                     .context(DecodePixelDataSnafu)?
-                    .to_vec()
+                    .to_vec() */
+                    panic!("Multi-frame dicoms are not supported yet");
                 } else {
                     decode_single_frame_compressed(
                         &fragments[0],
